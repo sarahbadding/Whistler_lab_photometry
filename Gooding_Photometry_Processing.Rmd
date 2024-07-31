@@ -1,0 +1,389 @@
+---
+title: "Nucleus accumbens sub-regions experience distinct dopamine release responses following acute and chronic morphine exposure"
+output: html_notebook
+---
+
+#Libraries
+```{r}
+library(tcltk2)
+library(lubridate)
+library(tidyverse)
+library(accelerometry)
+library(pracma)
+library(Matrix)
+library(zoo)
+```
+
+#Martianova JOVE functions 
+These functions are used to construct standardized and slope-corrected data for peak analysis
+citation: Martianova, E., Aronson, S., Proulx, C.D.__ [Multi-Fiber Photometry to Record Neural Activity in Freely Moving Animal.](https://www.jove.com/video/60278/multi-fiber-photometry-to-record-neural-activity-freely-moving). _J. Vis. Exp._ (152), e60278, doi:10.3791/60278 (2019).
+```{r}
+WhittakerSmooth <- function(x,w,lambda,differences=1) {
+  x=matrix(x,nrow = 1, ncol=length(x))
+  L=length(x)
+  E=spMatrix(L,L,i=seq(1,L),j=seq(1,L),rep(1,L))
+  D=as(diff(E,1,differences),"dgCMatrix")
+  W=as(spMatrix(L,L,i=seq(1,L),j=seq(1,L),w),"dgCMatrix")
+  background=solve((W+lambda*t(D)%*%D),t((w*x)));
+  return(as.vector(background))
+}
+
+airPLS <- function(x,lambda=10,differences=1, itermax=20){
+  
+  x = as.vector(x)
+  m = length(x)
+  w = rep(1,m)
+  control = 1
+  i = 1
+  while(control==1){
+    z = WhittakerSmooth(x,w,lambda,differences)
+    d = x-z
+    sum_smaller = abs(sum(d[d<0])) 
+    if(sum_smaller<0.001*sum(abs(x))||i==itermax)
+    {
+      control = 0
+    }
+    w[d>=0] = 0
+    w[d<0] = exp(i*abs(d[d<0])/sum_smaller)
+    w[1] = exp(i*max(d[d<0])/sum_smaller)
+    w[m] = exp(i*max(d[d<0])/sum_smaller)
+    i=i+1
+  }
+  return(z) 
+}
+
+movavg <- function(v, win)
+{
+  # Calculates moving average
+  # 
+  # Input
+  #     v: vector to smooth
+  #     win: window for moving average
+  # Output
+  #     smoothed signal
+  #
+  
+  f = rep(1, win) / win
+  n = length(v)
+  v1 = c(rep(v[1], win), v, rep(v[n],win))
+  v1 = stats::filter(v1, f)
+  return(v1[win+1:n])
+}
+
+get_zdFF <- function(reference, signal, smooth_win=60, remove=200, lambda=5e4, itermax=50, differences=1)
+{
+  # Calculates z-score dF/F signal based on fiber photometry calcium-idependent 
+  # and -dependent signals.
+  #
+  # This program is a translation in R of the Python source code of get_zdFF.py
+  #
+  # Input 
+  #     reference: calcium-independent signal (usually 405-420 nm excitation)
+  #     signal: calcium-dependent signal (usually 465-490 nm excitation 
+  #             for green fluorescent proteins, or ~560 nm for red)
+  #     smooth_win: window for moving average smooth 
+  #     remove: the beginning of the traces with a steep slope one would like 
+  #             to remove
+  #  Inputs for airPLS:
+  #   lambda: lambda is an adjustable parameter, it can be adjusted by user. 
+  #             The larger lambda is, the smoother baseline will be 
+  #     itermax: maximum iteration times
+  #     differences
+  #
+  #  Output
+  #     zdFF - z-score dF/F, 
+  #    
+  #  Examples:
+  #     zdFF = get_zdFF(reference, signal);
+  #     zdFF = get_zdFF(reference, signal, 10, 200, 5e4, 50, 1);
+  #
+  #  Reference:
+  #    (1) Martianova, E., Aronson, S., Proulx, C.D. Multi-Fiber Photometry 
+  #         to Record Neural Activity in Freely Moving Animal. J. Vis. Exp. 
+  #         (152), e60278, doi:10.3791/60278 (2019)
+  #         https://www.jove.com/video/60278/multi-fiber-photometry-to-record-neural-activity-freely-moving
+  #
+  #  March 2020 Ekaterina Martianova ekaterina.martianova.1@ulaval.ca
+    
+  
+ # Smooth signals
+  reference = movavg(reference, smooth_win)
+  signal = movavg(signal, smooth_win)
+  
+ # Find slope using airPLS algorithm
+  require(airPLS)
+  base_r <- airPLS(reference, lambda, differences, itermax)
+  base_s <- airPLS(signal, lambda, differences, itermax)
+  
+ # Remove slope and the begining of the recordings
+  n = length(reference)
+  reference = reference[remove:n] - base_r[remove:n]
+  signal = signal[remove:n] - base_s[remove:n]
+  
+ # Standardize signals
+  
+###
+#SWG adjustment to standardize to baseline period
+  bl_reference = reference[1:as.integer(880 / 0.008203 - remove)] #range is based on length of baseline period before injection
+  bl_signal = signal[1:as.integer(880 / 0.008203 - remove)]
+  
+  reference = (reference - median(bl_reference)) / sd(bl_reference)
+  signal = (signal - median(bl_signal)) / sd(bl_signal)
+###  
+  
+  #ORIGINAL VERSION (standardizes across entire recording)
+  # reference = (reference - median(reference)) / sd(reference)
+  # signal = (signal - median(signal)) / sd(signal)
+  
+ # Linear robust fit
+  require(MASS)
+  fit <- rlm(signal ~ reference)
+  reference <- predict(fit)
+  
+ # Calculate z-score dF/F
+  zdFF <- signal - reference
+  
+  return(zdFF)
+  
+}
+```
+
+#SWG custom functions
+```{r}
+#Function to remove hardware glitches from raw data before DF/F calculation
+glitchremove <- function(channel, timestamps, slope_factor = 20, y_factor = 10, replace = 30, sampling_rate = 120) {
+   # Input 
+  #     channel: raw data values from a single channel
+  #     timestamps: time values that accompany fluorescence data in channel
+  #     slope_factor: number of standard deviations above the median to use as a 
+  #             threshold for detecting slope anomalies
+  #     y_factor: number of standard deviations above the median to use as a 
+  #             threshold for detecting y value anomalies
+  #     replace: size of the window (in seconds) of previous data to use to calculate replacement values
+  #     sampling_rate: number of data points per second in source data
+  
+    #calculate instantaneous slopes for raw data channels
+  chanlength <- length(channel)
+  slope <- numeric()
+  for (j in 1:chanlength) {
+    slope[j] <- (channel[j+1] - channel[j])/(timestamps[j+1] - timestamps[j])
+  }
+  #set slope threshold to identify bad data
+  thresh <- median(slope, na.rm = T) + slope_factor*sd(na.omit(slope))
+  replace_window <- replace * sampling_rate
+  
+#replace artifact data with median of previous 30 seconds
+  for (j in 1:chanlength) {
+    if (j < chanlength & abs(slope[j]) > thresh & !is.na(channel[j])) {
+      j = j+1 #examine y values starting with next point
+      if (j > replace_window & j <= chanlength) { 
+        #use sd of previous 30 seconds to determine reasonable threshold for y
+        slopemed <- median(channel[(j-replace_window):(j-1)], na.rm = T)
+        highend <- slopemed + y_factor*sd(channel[(j-replace_window):(j-1)], na.rm = T)
+        lowend <- slopemed - y_factor*sd(channel[(j-replace_window):(j-1)], na.rm = T)
+        while (j < chanlength & (channel[j] > highend | channel[j] < lowend)){
+          channel[j] <- slopemed #replace y values with median of last interval
+          j = j+1 #move on to next 
+          }
+    } else { #if artifact is < 30s in, use all previous data points
+          slopemed <- median(channel[1:(j-1)], na.rm = T)
+          highend <- slopemed + y_factor*sd(channel[1:(j-1)], na.rm = T)
+          lowend <- slopemed - y_factor*sd(channel[1:(j-1)], na.rm = T)
+        while (j < chanlength & (channel[j] > highend | channel < lowend)){
+          channel[j] <- slopemed
+          j = j+1
+        }
+      }
+    }
+  }
+  return(channel)
+}
+
+#deltaF/F calculation - designed to work with column labels assigned in SWG data processing
+deltaFF <- function(data, time_factor = 60, reference_start = min(data$Time)/time_factor, reference_end = max(data$Time)/time_factor) {
+  #This function uses a specified sub-range of the data to construct the linear model used to define predicted values for the entire recording. Intended use is on data with a baseline before a drug manipulation occurs.
+  
+     # Input 
+  #     data: must be a data frame containing properly labeled columns for Time, CH405, & CH465
+  #     reference start: starting point in data to use for linear model, defaults to beginning of recording
+  #     reference_end: end point in data to use for linear model, defaults to end of recording
+  #     time_factor: number to use for conversion of timestamps into minutes. 60 if your data represents timestamps as seconds. 
+
+#calculate dFF based on predictions from baseline period alone
+    baseline <- data %>% filter(Time >= reference_start * time_factor & 
+                                  Time <= reference_end * time_factor)
+
+    reg_data <- lm(CH465 ~ CH405, data = baseline)
+    reference <-  data.frame(CH405 = data$CH405)
+    fitted <- predict(reg_data, reference)
+    
+    deltaFF <- (data$CH465 - fitted)/fitted
+    
+    return(deltaFF)
+}
+
+##Peak analysis functions
+
+#Function to calculate rolling threshold using median absolute deviation (MAD)
+rollThresh <- function(data, threshfactor = 2.91, window = 30, sampling_rate = 120) { 
+ # Input 
+  #     data: data intended for peak analysis. best if photobleaching correction 
+  #     and normalization steps have already occurred
+  #     threshfactor: number by which the MAD is multiplied to create threshold, 
+  #     default threshold based on DOI: 10.1073/pnas.1521238113
+  #     window: size of window (in seconds) to use for rolling calculation
+  #     sampling_rate: number of data points per second in source data
+  
+#Make sure window size is odd number for rolling median
+peakwin <- window * sampling_rate 
+if ((peakwin %% 2) == 0) {
+  peakwin <- peakwin + 1
+}
+
+#create a rolling median absolute deviation to use as a dynamic peak threshold
+z1 <- rollmedian(data, k = peakwin) #calculate rolling median of data
+trimwindow <- length(data) - length(z1) #window size to remove 
+z2 <- abs(data[-(1:trimwindow)] - z1) #calculate deviations from rolling median
+z3 <- rollmedian(z2, k = peakwin) #calculate rolling median absolute deviation
+z4 <- threshfactor * z3 #multiply MAD by factor to create rolling threshold
+
+return(z4)
+  }
+
+#Identify time and magnitude of all peaks in a recording
+photompeaks <- function(data, threshfactor = 2.91, minpeakdistance = 60, window = 30, sampling_rate = 120) {
+ # Input 
+  #     data: data frame generated from SWG photometry processing
+  #     threshfactor: input for rollThresh(), factor by which the MAD is multiplied to
+  #     create threshold, default based on Calipari, 2016
+  #     minpeaksdistance: input for findpeaks(), default represents 0.5 seconds with a sampling rate of 120 data points/s)
+  
+#calculate a normalized, flattened dF/F trace from the martianova code using airPLS
+zdFF = get_zdFF(data$CH405, data$CH465, remove = 0)
+
+z <- data %>% 
+  mutate(zdFF = c(rep(NA, nrow(data) - length(zdFF)), zdFF)) %>% 
+  dplyr::filter(!is.na(zdFF))
+
+#calculate rolling threshold & rolling average
+threshroll <- rollThresh(z$zdFF, threshfactor = threshfactor)
+meanroll <- rollmean(z$zdFF, window * sampling_rate)
+
+#find all local maxima
+zpeaks <- findpeaks(z$zdFF, minpeakdistance = minpeakdistance)
+peakinfo <- data.frame(peakInd = zpeaks[,2], peakMag = zpeaks[,1]) %>% 
+  arrange(peakInd) %>% 
+  mutate(Time = z$Time[peakInd])
+
+#filter out peaks that don't meet threshold criteria
+z5 <- z %>% 
+  mutate(meanroll = c(rep(NA, nrow(z) - length(meanroll)), meanroll),
+         threshroll = c(rep(NA, nrow(z) - length(threshroll)), threshroll)) %>% 
+  full_join(peakinfo) %>% 
+  dplyr::filter(!is.na(threshroll)) %>% 
+  mutate(peakMag = case_when(peakMag >= threshroll ~ peakMag, TRUE ~ as.numeric(NA))) %>% 
+  dplyr::filter(!is.na(peakMag))
+
+return(z5)
+}
+```
+
+
+#Read in and make master dataframe
+This code assumes all desired files for analysis are in the same directory. It also assumes files are named according to this naming convention: Date_MouseID_Experiment_n
+  -Date format is YYMMDD (e.g. "231005" for October 5, 2023)
+  -Mouse is any combination of letters and numbers with no punctuation except periods (e.g. "DWT123" or "RMOR4.07")
+  -Experiment is any combination of letters and numbers representing the nature of the recording that day (e.g. "Morphine1"), it is recommended that a mouse with multiple recordings have a different Experiment identifier for each recording
+  -n is the file iteration from the Doric software, the number is irrelevant for analysis
+```{r}
+#IMPORT ALL FILES AND MAKE dFF DATA FRAMES
+#takes individual recordings in .csv format
+#all files needed for desired analysis must be in the same directory
+setwd(tk_choose.dir(caption = "Where is your data?"))
+filenames <- list.files(getwd())
+filenames <- filenames[grepl(".csv$", filenames)] 
+
+#set desired window of recording in seconds
+#will trim off the beginning and/or end to make all recordings the same length
+frontcut <- 0
+endcut <- 1800
+
+avgwin <- 3600 #size of window to use for moving average
+
+processed_data <- list()
+for (i in 1:length(filenames)) {
+  
+  #import raw .csv file
+  mouse_raw <- read.csv(filenames[i], header = TRUE, skip = 1)
+  
+
+#make fresh df with new labels
+  #can be used to rename columns in raw data frame
+  dsdata <- data.frame(Time = mouse_raw$Time.s., 
+                       CH405 = mouse_raw$AIn.2...Dem..AOut.1., 
+                       CH465 = mouse_raw$AIn.2...Dem..AOut.2., stringsAsFactors = FALSE)
+  dsdata <- na.omit(dsdata)
+
+  dsdata <- dsdata %>%
+    dplyr::filter(Time > frontcut, Time <= endcut) %>%
+    mutate(mins = Time/60) %>%
+    mutate(file = filenames[i]) %>%
+    extract(file, c("Date", "Mouse", "Drug"), "([[:alnum:]]+)_([.[:alnum:]]+)_([[:alnum:]]+)", remove = T) %>%
+    unite(datemouse, Date, Mouse, remove = F) %>%
+    unite(drugmouse, Mouse, Drug, remove = F) %>% 
+    mutate(Date = ymd(Date))
+
+#remove hardware glitches
+  new405 <- glitchremove(channel = dsdata$CH405, timestamps = dsdata$Time)
+  new465 <- glitchremove(channel = dsdata$CH465, timestamps = dsdata$Time)
+
+  dsdata <- dsdata %>% 
+    mutate(CH405 = new405, CH465 = new465)
+
+#deltaFF calculation based on pre-injection baseline window
+dsdata$deltaFF <- deltaFF(dsdata, reference_end = 14.75)
+
+#z-score and smooth the DFF
+dsdata <- dsdata %>%
+  mutate(zscore = (deltaFF - mean(deltaFF))/sd(deltaFF)) %>%
+  mutate(smoothz = c(rep(NA, avgwin-1), movingaves(zscore, avgwin)))
+
+#Different z-scoring based on baseline period
+submean <- mean((dsdata %>%
+  dplyr::filter(mins < 14.75))$deltaFF)
+subsd <- sd((dsdata %>%
+  dplyr::filter(mins < 14.75))$deltaFF)
+
+dsdata <- dsdata %>%
+  mutate(zscore2 = (deltaFF - submean)/subsd) %>%
+  mutate(smoothz2 = c(rep(NA, avgwin-1), movingaves(zscore2, avgwin)))
+  
+  processed_data[[i]] <- dsdata
+}
+
+names(processed_data) <- filenames
+all_data <- bind_rows(processed_data) 
+```
+
+#Peak analysis
+```{r}
+unique_drugmouse <- unique(all_data$drugmouse)
+peaklist <- list()
+for (drugmouse_value in unique_drugmouse) {
+    # Subset the data frame for the current datemouse
+    data <- subset(all_data, drugmouse == drugmouse_value) %>% 
+      dplyr::select(drugmouse, Time, CH405, CH465, Mouse, Drug)
+
+peaksfound <- photompeaks(data = data)  
+
+peaklist[[drugmouse_value]] <- peaksfound
+}
+
+#data frame of all peaks in the dataset
+all_peaks <- bind_rows(peaklist) %>% 
+  group_by(drugmouse) %>% 
+  arrange(Time) %>% 
+  mutate(IPI = c(NA, diff(Time))) %>% 
+  ungroup() %>% 
+  mutate(prominence = peakMag - meanroll)
+```
